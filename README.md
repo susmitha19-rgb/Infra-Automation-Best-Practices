@@ -1,112 +1,108 @@
-# Reusable, multi-cloud Terraform
+# Enterprise multi-cloud Terraform platform
 
-Reusable modules and deployable environment roots are separate:
+This repository is the infrastructure-as-code repository for a layer-based Azure and AWS platform. It provides reusable provider-specific modules, isolated environment roots, and Azure DevOps validation and deployment pipelines. Application source code and application build/release pipelines belong in separate application repositories; those repositories consume platform services but do not share Terraform state with this repository.
 
-- `modules/` contains independently reusable modules. Azure and AWS modules are separate implementations because each cloud has different resources and providers. The module interfaces (inputs/outputs) follow the same layer-oriented conventions.
-- `live/` contains deployment roots, which compose pinned module releases and own backend configuration. Each cloud/environment/layer root has one independent remote state.
+## Platform architecture
 
-## Repository structure
+The canonical deployment layers are:
+
+| Layer | Typical responsibility |
+|---|---|
+| `foundation` | Account/subscription baselines, identity prerequisites, policy, and state backends |
+| `shared-services` | Shared DNS, logging, monitoring, and common platform services |
+| `security` | Security controls, key management, and guardrails |
+| `network` | VPC/VNet, subnets, routing, and private connectivity |
+| `data` | Managed databases, queues, and data services |
+| `compute` | Virtual machines and other compute infrastructure |
+| `platform` | Container, runtime, and developer platform services |
+| `integration` | Cross-platform and external-system integration |
+| `operations` | Backup, observability, and operational tooling |
+
+The `network` directory is the repository's existing name for the **Networking** layer. The older `application` roots in `dev` provision application-facing infrastructure (Azure Storage/AWS S3); they are retained for compatibility and are not an application source-code repository or a tenth canonical layer.
+
+Each canonical layer has its own root for every environment and cloud:
 
 ```text
-modules/
-  network/
-    azure/resource-group/
-    azure/virtual-network/
-    aws/vpc/
-  compute/
-    azure/linux-virtual-machine/
-    aws/ec2-instance/
-  application/
-    azure/storage-account/
-    aws/s3-bucket/
-live/
-  dev/
-    azure/{network,compute,application}/
-    aws/{network,compute,application}/
-templates/terraform-pipeline.yml
-azure-pipelines-module-release.yml
-azure-pipelines-{azure,aws}[-{compute,application}].yml
+environments/
+  {dev,sit,uat,prod}/
+    {azure,aws}/
+      {foundation,shared-services,security,network,data,compute,platform,integration,operations}/
 ```
 
-Every module has `main.tf`, `variables.tf`, `outputs.tf`, and `version.tf`. The module `version.tf` declares a compatible Terraform version and required provider source/version. Modules do not configure providers or remote state; callers provide provider configuration. Each live root also has its own provider/backend configuration and `.terraform.lock.hcl`.
+Provider-specific implementations remain separate under `modules/<layer>/{azure,aws}/`. A root may compose only modules for its cloud. Add resources and modules only when that layer's ownership, inputs, outputs, and security requirements are defined. Newly scaffolded roots intentionally contain no managed resources; they validate and plan safely without implying that a layer's design is complete.
 
-## Separate remote state for every layer
+The intended promotion sequence is foundation, shared services, security, networking, data, compute, platform, integration, and operations. Actual dependencies must be declared through narrowly scoped remote-state outputs or other approved interfaces, not by sharing state. Deploy prerequisite layers first and destroy dependent layers first. Do not add a dependency merely because one layer is earlier in this sequence.
 
-| Live root | Remote state key |
+The currently implemented provider-specific modules are Azure resource group/virtual network, Linux virtual machine, and storage account modules, plus AWS VPC, EC2 instance, and S3 bucket modules. These are currently composed by the dev roots. The other canonical layer roots, and network/compute roots outside dev, are state/pipeline-ready scaffolds with no managed resources until their designs and modules are supplied.
+
+## State and environment isolation
+
+Every cloud/environment/layer root has a separate backend state. The object key follows `<cloud>/<environment>/<layer>.tfstate`, for example:
+
+| Root | State key |
 |---|---|
-| `live/dev/azure/network` | `azure/dev/network.tfstate` |
-| `live/dev/azure/compute` | `azure/dev/compute.tfstate` |
-| `live/dev/azure/application` | `azure/dev/application.tfstate` |
-| `live/dev/aws/network` | `aws/dev/network.tfstate` |
-| `live/dev/aws/compute` | `aws/dev/compute.tfstate` |
-| `live/dev/aws/application` | `aws/dev/application.tfstate` |
+| `environments/dev/azure/network` | `azure/dev/network.tfstate` |
+| `environments/sit/aws/security` | `aws/sit/security.tfstate` |
+| `environments/uat/azure/data` | `azure/uat/data.tfstate` |
+| `environments/prod/aws/operations` | `aws/prod/operations.tfstate` |
 
-Azure uses the `azurerm` backend, storing each state as a blob in a private Azure Storage container. AWS uses the S3 backend, storing each state as a separate S3 object and using Terraform 1.10+ S3 lock files. Backend bucket/container and credentials are supplied to `terraform init` by the deployment pipelines; they are deliberately not committed in backend files.
+Azure roots use the `azurerm` backend with a private Storage container; AWS roots use S3 with Terraform 1.10+ S3 lock files. Backend names and credentials are supplied by Azure DevOps at initialization time, not stored in backend configuration. Provision and secure both state stores independently. Enable encryption, versioning/recovery, least-privilege access, and appropriate retention. The pipeline identity needs access only to the backend and resources required by its root.
 
-Provision both remote backend stores independently from these workloads. The Azure service identity requires state-container data permissions; the AWS role requires state object and `.tflock` permissions. Grant access only to the states and resources each layer needs. Compute reads the network layer outputs through `terraform_remote_state`; Azure application reads the network layer's resource group and location. Deploy network first and destroy dependent layers first in reverse order. Separate states are independent and are not transactional.
+An apply to one root changes only that root's state. It does not make changes to other layers transactional; a drift repair, refresh, plan, or apply remains scoped to the selected root. Back up and deliberately migrate any pre-existing combined state before using these roots against resources tracked by it.
 
-Do not apply these new roots against an existing combined stack until its state has been backed up and deliberately migrated. Otherwise Terraform can attempt to recreate resources already present in the old state.
+## Modules and repository boundaries
 
-## Module versions and releases
+- `modules/` contains reusable Terraform modules, with separate Azure and AWS implementations where resource APIs or providers differ.
+- `environments/` contains deployment roots and backend configuration. Roots pin module Git tags and own their independent state.
+- `azure-pipelines.yml` is the single infrastructure pipeline entry point. `templates/terraform-pipeline.yml` holds its reusable CI/CD stages.
+- Application source and its build/deployment pipeline belong in a separate application repository. That pipeline consumes infrastructure interfaces (such as service endpoints or published outputs) and does not check out or modify this repository's Terraform state.
 
-`azure-pipelines-module-release.yml` validates every module on PR. After module changes merge to `main`, it creates immutable, module-specific annotated Git tags and publishes source bundles as a pipeline artifact. The first release is `v1.0.0`; later module changes increment that module's patch version. Example tag:
+Modules declare Terraform/provider requirements but do not configure providers or remote state. Keep module interfaces stable and layer-oriented. Live roots use immutable, exact module tags; update a pin through a reviewed change rather than consuming a moving branch.
+
+## Azure DevOps CI/CD
+
+Register **one** Azure DevOps pipeline for `azure-pipelines.yml`. Pull requests and main-branch runs format-check and validate all reusable modules and all Terraform roots. On `main`, changed modules are versioned with immutable annotated Git tags; the first release is `v1.0.0`, and later changes increment that module's patch version. Example:
 
 ```text
 terraform-network-azure-virtual-network-v1.0.1
 ```
 
-Live roots consume exact Git tag versions in their `module.source` references, so a module change does not change an environment until its pinned `ref` is intentionally updated and reviewed. Release tags are read-only by policy: do not overwrite or delete them. The pipeline identity needs repository read and tag-create/push permissions.
+On a main-branch run, the pipeline automatically plans and applies changed roots after validation. Defaults are both clouds, dev, and changed layers. Select Azure or AWS for one cloud, select an environment deliberately, and choose one of three scopes: `changed` deploys roots changed in the triggering commit, `layer` deploys the chosen layer, and `all` deploys every layer in dependency order. An `all` run can target one cloud or both clouds; the legacy application-infrastructure root is included in dev. Each root still uses its own state file, and the saved plan for each cloud/layer is the plan that gets applied. If a change is made for SIT, UAT, or production, run the pipeline with that environment selected; non-production applies automatically after validation. Multi-root applies are sequential, not transactional: if one root fails, earlier successful applies remain in place and later roots are not applied.
 
-Replace `REPLACE_ORG`, `REPLACE_PROJECT`, and `REPLACE_REPO` in the six live root `main.tf` files with your Azure DevOps organization, project, and repository. The layer pipelines persist checkout credentials so Terraform can fetch private modules from the same repo. Ensure the pipeline identity has repository read access.
+Non-production deployments proceed automatically after validation. A production run stops at the `ProductionApproval` manual-validation stage before apply. Only approve after reviewing the plan artifact. Do not configure additional manual approvals on non-production environments. Do not overwrite or delete module release tags. The pipeline identity needs repository read and tag-create/push permissions.
 
-Bootstrap by registering/running the module release pipeline first and waiting for the initial module tags. Then enable live pipelines. Update each live root's pinned tag when promoting a module release.
+Before enabling deployments:
 
-The pipeline artifact is a downloadable/archive copy of each versioned module. Terraform itself fetches the pinned tag from Git; the artifact is retained for release traceability. If you require deployment roots to install modules only from Azure Artifacts rather than Git, that needs a package-download/extract step in the deployment pipeline instead.
+1. Provision the Azure Storage state container and encrypted, versioned S3 state bucket; configure recovery and lock-file permissions.
+2. Create least-privilege Azure Resource Manager and AWS service connections. Prefer workload federation or short-lived credentials.
+3. Configure the backend-store placeholders in `azure-pipelines.yml`, and select the appropriate service connection when queuing a deployment. Keep backend settings consistent and do not commit credentials.
+4. Create Azure DevOps Environments named `terraform-<cloud>-<environment>` for audit/tracking. The pipeline's production approval is an explicit manual-validation stage; no separate manual approval is needed on non-production environments.
+5. Replace the Azure Repos placeholders in existing live module sources with the correct organization, project, and repository before validating those roots.
+6. Use non-secret example variable values. Never put credentials, private keys, or other secrets in Terraform files, variable files, or saved plan artifacts. Restrict access to plan artifacts because they can contain sensitive values.
 
-## Azure DevOps deployment pipelines
+This infrastructure pipeline does not deploy application code. The separate application repository owns its build and release lifecycle and deploys independently against the provisioned platform, so application releases do not trigger infrastructure state changes.
 
-Register one pipeline per live root:
+The legacy dev AWS sample has no internet gateway/NAT, and its instances have no public IP or inbound security-group rule. Add organization-approved private connectivity and management access before deploying workloads that require access.
 
-| Pipeline YAML | Root | Remote state key |
-|---|---|---|
-| `azure-pipelines-azure.yml` | `live/dev/azure/network` | `azure/dev/network.tfstate` |
-| `azure-pipelines-azure-compute.yml` | `live/dev/azure/compute` | `azure/dev/compute.tfstate` |
-| `azure-pipelines-azure-application.yml` | `live/dev/azure/application` | `azure/dev/application.tfstate` |
-| `azure-pipelines-aws.yml` | `live/dev/aws/network` | `aws/dev/network.tfstate` |
-| `azure-pipelines-aws-compute.yml` | `live/dev/aws/compute` | `aws/dev/compute.tfstate` |
-| `azure-pipelines-aws-application.yml` | `live/dev/aws/application` | `aws/dev/application.tfstate` |
+## Extending a layer
 
-The pipelines share `templates/terraform-pipeline.yml`: PRs validate; main-branch builds plan and apply the exact saved plan behind an Azure DevOps Environment approval.
-
-Before deployment:
-
-1. Provision an Azure Storage account/private state container and an encrypted, versioned S3 state bucket.
-2. Create least-privilege Azure Resource Manager and AWS service connections. Prefer workload federation/short-lived credentials.
-3. Replace state-store and service-connection placeholders in the pipeline files. Keep backend settings consistent within each cloud. Compute and Azure application identities also require read access to network state.
-4. Create protected Azure DevOps Environments: `terraform-azure-dev-{network,compute,application}` and `terraform-aws-dev-{network,compute,application}`.
-5. Set unique non-secret values in each `terraform.tfvars.example`. Azure compute needs an SSH public key; AWS compute needs an AMI ID valid in the chosen region. Never put private keys or credentials into Terraform variables.
-6. Restrict who can edit pipelines, use service connections, push release tags, and read saved plan artifacts. Plans may contain sensitive values.
-
-The sample AWS subnet has no internet gateway/NAT, and instances have no public IP or inbound security-group rule. Add organization-approved private connectivity and management access before deploying workloads that require access.
+1. Define the layer's resource ownership, module interface, data classification, dependency direction, and operational responsibilities.
+2. Implement and validate provider-specific modules under `modules/<layer>/<cloud>/`; avoid cross-cloud conditionals in provider-specific resources.
+3. Add module tests/validation and release a new immutable module tag.
+4. Compose the pinned release in the corresponding `environments/<environment>/<cloud>/<layer>/main.tf`. Add only the variables and outputs needed by that layer.
+5. Add explicit remote-state access only for documented upstream outputs. Keep credentials and backend settings outside source control.
+6. Review the plan, approval policy, IAM/RBAC permissions, and state key before enabling apply. Choose the target environment deliberately. Dev, SIT, and UAT apply automatically after validation; production pauses for explicit manual approval.
 
 ## Local checks
 
-Use Terraform 1.10.5 (the pipeline version). After replacing the Azure Repos placeholders and creating initial tags:
+Use Terraform 1.10.5, matching the pipelines. For example:
 
 ```sh
 terraform fmt -check -recursive
-terraform -chdir=live/dev/azure/network init -backend=false
-terraform -chdir=live/dev/azure/network validate
-terraform -chdir=live/dev/azure/compute init -backend=false
-terraform -chdir=live/dev/azure/compute validate
-terraform -chdir=live/dev/azure/application init -backend=false
-terraform -chdir=live/dev/azure/application validate
-terraform -chdir=live/dev/aws/network init -backend=false
-terraform -chdir=live/dev/aws/network validate
-terraform -chdir=live/dev/aws/compute init -backend=false
-terraform -chdir=live/dev/aws/compute validate
-terraform -chdir=live/dev/aws/application init -backend=false
-terraform -chdir=live/dev/aws/application validate
+terraform -chdir=environments/dev/azure/network init -backend=false
+terraform -chdir=environments/dev/azure/network validate
+terraform -chdir=environments/sit/aws/security init -backend=false
+terraform -chdir=environments/sit/aws/security validate
 ```
 
-Commit each live root's `.terraform.lock.hcl` to keep provider selections reproducible. Real deployments must use each root's configured remote backend, never local state.
+Run `init -backend=false` and `validate` for every changed root and commit its `.terraform.lock.hcl`. Real deployments must use each root's configured remote backend, never local state.

@@ -2,15 +2,18 @@ parameters:
   - name: cloud
     type: string
     values:
+      - both
       - azure
       - aws
-  - name: workingDirectory
+  - name: targetEnvironment
+    type: string
+  - name: deploymentScope
+    type: string
+  - name: layer
     type: string
   - name: tfvarsFile
     type: string
     default: terraform.tfvars.example
-  - name: backendKey
-    type: string
   - name: environment
     type: string
   - name: azureServiceConnection
@@ -37,13 +40,108 @@ stages:
           - bash: |
               set -euo pipefail
               terraform fmt -check -recursive
-              terraform -chdir="${{ parameters.workingDirectory }}" init -backend=false -input=false
-              terraform -chdir="${{ parameters.workingDirectory }}" validate
-            displayName: Format and validate
+              while IFS= read -r module_dir; do
+                echo "Validating $module_dir"
+                terraform -chdir="$module_dir" init -backend=false -input=false
+                terraform -chdir="$module_dir" validate
+              done < <(find modules -type f -name version.tf -printf '%h\n' | sort)
+              while IFS= read -r root; do
+                echo "Validating $root"
+                terraform -chdir="$root" init -backend=false -input=false
+                terraform -chdir="$root" validate
+              done < <(find environments -type f -name backend.tf -printf '%h\n' | sort)
+            displayName: Format and validate all modules and roots
+
+  - stage: ReleaseModules
+    displayName: Version changed modules
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: release
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0
+          - bash: |
+              set -euo pipefail
+              git fetch --tags origin
+              git config user.name "Azure DevOps"
+              git config user.email "azuredevops@local"
+              artifact_dir="$(Build.ArtifactStagingDirectory)/module-releases"
+              manifest="$artifact_dir/release-manifest.txt"
+              mkdir -p "$artifact_dir"
+
+              base="$(git rev-parse HEAD^ 2>/dev/null || true)"
+              if [[ -n "$base" ]]; then
+                changed_files="$(git diff --name-only "$base" HEAD -- modules/)"
+              else
+                changed_files="$(git ls-tree -r --name-only HEAD -- modules/)"
+              fi
+
+              mapfile -t changed_modules < <(
+                printf '%s\n' "$changed_files" |
+                  awk -F/ 'NF >= 5 && $1 == "modules" { print $1 "/" $2 "/" $3 "/" $4 }' |
+                  sort -u
+              )
+
+              if [[ ${#changed_modules[@]} -eq 0 ]]; then
+                echo "No module changes found." | tee "$manifest"
+              fi
+
+              for module_dir in "${changed_modules[@]}"; do
+                if [[ ! -f "$module_dir/version.tf" ]]; then
+                  echo "Module is missing version.tf: $module_dir" >&2
+                  exit 1
+                fi
+
+                module_name="${module_dir#modules/}"
+                tag_prefix="terraform-${module_name//\//-}"
+                module_tags="$(git tag --list "${tag_prefix}-v*")"
+                version="$(python3 - "$module_tags" "$tag_prefix" <<'PY'
+              import re
+              import sys
+
+              tags, prefix = sys.argv[1:]
+              pattern = re.compile(re.escape(prefix) + r"-v(\d+)\.(\d+)\.(\d+)")
+              versions = [
+                  tuple(map(int, match.groups()))
+                  for tag in tags.splitlines()
+                  if (match := pattern.fullmatch(tag))
+              ]
+              if not versions:
+                  print("1.0.0")
+              else:
+                  major, minor, patch = max(versions)
+                  print(f"{major}.{minor}.{patch + 1}")
+              PY
+              )"
+                tag="${tag_prefix}-v${version}"
+
+                echo "Releasing $module_dir as $tag"
+                git tag -a "$tag" -m "Release $module_name v$version"
+                git push origin "refs/tags/$tag"
+
+                release_dir="$artifact_dir/$module_name"
+                mkdir -p "$release_dir"
+                git archive --format=tar "$tag" "$module_dir" |
+                  gzip > "$release_dir/${tag}.tar.gz"
+                printf '%s\n' "$tag" > "$release_dir/version.txt"
+                printf '%s %s\n' "$module_dir" "$tag" | tee -a "$manifest"
+              done
+            displayName: Tag module releases and create source bundles
+          - task: PublishPipelineArtifact@1
+            displayName: Publish versioned module bundles
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/module-releases
+              artifact: terraform-module-releases
 
   - stage: Plan
     displayName: Plan deployment
-    dependsOn: Validate
+    dependsOn:
+      - Validate
+      - ReleaseModules
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
     jobs:
       - job: plan
@@ -52,12 +150,14 @@ stages:
         steps:
           - checkout: self
             persistCredentials: true
+            fetchDepth: 0
           - task: TerraformInstaller@1
             displayName: Install Terraform
             inputs:
               terraformVersion: 1.10.5
-          - ${{ if eq(parameters.cloud, 'azure') }}:
+          - ${{ if ne(parameters.cloud, 'aws') }}:
               - task: AzureCLI@2
+                name: planAzure
                 displayName: Initialize backend and create plan
                 inputs:
                   azureSubscription: ${{ parameters.azureServiceConnection }}
@@ -65,20 +165,19 @@ stages:
                   scriptLocation: inlineScript
                   inlineScript: |
                     set -euo pipefail
-                    working_dir="${{ parameters.workingDirectory }}"
-                    mkdir -p "$(Build.ArtifactStagingDirectory)/terraform-plan"
-                    terraform -chdir="$working_dir" init -input=false \
-                      -backend-config="resource_group_name=$(AZURE_TFSTATE_RESOURCE_GROUP)" \
-                      -backend-config="storage_account_name=$(AZURE_TFSTATE_STORAGE_ACCOUNT)" \
-                      -backend-config="container_name=$(AZURE_TFSTATE_CONTAINER)" \
-                      -backend-config="key=${{ parameters.backendKey }}" \
-                      -backend-config="use_azuread_auth=true" \
-                      -backend-config="use_cli=true"
-                    terraform -chdir="$working_dir" plan -input=false -lock-timeout=5m \
-                      -var-file="${{ parameters.tfvarsFile }}" \
-                      -out="$(Build.ArtifactStagingDirectory)/terraform-plan/tfplan"
-          - ${{ if eq(parameters.cloud, 'aws') }}:
+                    CLOUD=azure TARGET_ENVIRONMENT="${{ parameters.targetEnvironment }}" \
+                    DEPLOYMENT_SCOPE="${{ parameters.deploymentScope }}" LAYER="${{ parameters.layer }}" \
+                    TFVARS_FILE="${{ parameters.tfvarsFile }}" PLAN_ACTION=plan \
+                    PLAN_DIR="$(Build.ArtifactStagingDirectory)/terraform-plan" \
+                    AZURE_TFSTATE_RESOURCE_GROUP="$(AZURE_TFSTATE_RESOURCE_GROUP)" \
+                    AZURE_TFSTATE_STORAGE_ACCOUNT="$(AZURE_TFSTATE_STORAGE_ACCOUNT)" \
+                    AZURE_TFSTATE_CONTAINER="$(AZURE_TFSTATE_CONTAINER)" \
+                    AWS_TFSTATE_BUCKET="$(AWS_TFSTATE_BUCKET)" \
+                    AWS_TFSTATE_REGION="$(AWS_TFSTATE_REGION)" \
+                    bash templates/terraform-deploy.sh
+          - ${{ if ne(parameters.cloud, 'azure') }}:
               - task: AWSShellScript@1
+                name: planAws
                 displayName: Initialize backend and create plan
                 inputs:
                   awsCredentials: ${{ parameters.awsServiceConnection }}
@@ -86,26 +185,45 @@ stages:
                   scriptType: inline
                   inlineScript: |
                     set -euo pipefail
-                    working_dir="${{ parameters.workingDirectory }}"
-                    mkdir -p "$(Build.ArtifactStagingDirectory)/terraform-plan"
-                    terraform -chdir="$working_dir" init -input=false \
-                      -backend-config="bucket=$(AWS_TFSTATE_BUCKET)" \
-                      -backend-config="key=${{ parameters.backendKey }}" \
-                      -backend-config="region=$(AWS_TFSTATE_REGION)" \
-                      -backend-config="use_lockfile=true"
-                    terraform -chdir="$working_dir" plan -input=false -lock-timeout=5m \
-                      -var-file="${{ parameters.tfvarsFile }}" \
-                      -out="$(Build.ArtifactStagingDirectory)/terraform-plan/tfplan"
+                    CLOUD=aws TARGET_ENVIRONMENT="${{ parameters.targetEnvironment }}" \
+                    DEPLOYMENT_SCOPE="${{ parameters.deploymentScope }}" LAYER="${{ parameters.layer }}" \
+                    TFVARS_FILE="${{ parameters.tfvarsFile }}" PLAN_ACTION=plan \
+                    PLAN_DIR="$(Build.ArtifactStagingDirectory)/terraform-plan" \
+                    AZURE_TFSTATE_RESOURCE_GROUP="$(AZURE_TFSTATE_RESOURCE_GROUP)" \
+                    AZURE_TFSTATE_STORAGE_ACCOUNT="$(AZURE_TFSTATE_STORAGE_ACCOUNT)" \
+                    AZURE_TFSTATE_CONTAINER="$(AZURE_TFSTATE_CONTAINER)" \
+                    AWS_TFSTATE_BUCKET="$(AWS_TFSTATE_BUCKET)" \
+                    AWS_TFSTATE_REGION="$(AWS_TFSTATE_REGION)" \
+                    bash templates/terraform-deploy.sh
           - task: PublishPipelineArtifact@1
             displayName: Publish Terraform plan
             inputs:
               targetPath: $(Build.ArtifactStagingDirectory)/terraform-plan
               artifact: terraform-plan
 
+  - stage: ProductionApproval
+    displayName: Production approval
+    dependsOn: Plan
+    condition: and(succeeded(), eq('${{ parameters.targetEnvironment }}', 'prod'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'), or(eq(dependencies.Plan.outputs['plan.planAzure.hasDeploymentChanges'], 'true'), eq(dependencies.Plan.outputs['plan.planAws.hasDeploymentChanges'], 'true')))
+    jobs:
+      - job: approval
+        displayName: Wait for production approval
+        pool: server
+        timeoutInMinutes: 1440
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440
+            inputs:
+              notifyUsers: ''
+              instructions: Review the Terraform plan artifact for this production deployment, then approve to continue.
+              onTimeout: reject
+
   - stage: Apply
     displayName: Apply deployment
-    dependsOn: Plan
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    dependsOn:
+      - Plan
+      - ProductionApproval
+    condition: and(not(canceled()), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'), eq(dependencies.Plan.result, 'Succeeded'), or(eq(dependencies.Plan.outputs['plan.planAzure.hasDeploymentChanges'], 'true'), eq(dependencies.Plan.outputs['plan.planAws.hasDeploymentChanges'], 'true')), in(dependencies.ProductionApproval.result, 'Succeeded', 'Skipped'))
     jobs:
       - deployment: apply
         displayName: Apply reviewed plan
@@ -116,13 +234,14 @@ stages:
               steps:
                 - checkout: self
                   persistCredentials: true
+                  fetchDepth: 0
                 - task: TerraformInstaller@1
                   displayName: Install Terraform
                   inputs:
                     terraformVersion: 1.10.5
                 - download: current
                   artifact: terraform-plan
-                - ${{ if eq(parameters.cloud, 'azure') }}:
+                - ${{ if ne(parameters.cloud, 'aws') }}:
                     - task: AzureCLI@2
                       displayName: Initialize backend and apply plan
                       inputs:
@@ -131,16 +250,17 @@ stages:
                         scriptLocation: inlineScript
                         inlineScript: |
                           set -euo pipefail
-                          terraform -chdir="${{ parameters.workingDirectory }}" init -input=false \
-                            -backend-config="resource_group_name=$(AZURE_TFSTATE_RESOURCE_GROUP)" \
-                            -backend-config="storage_account_name=$(AZURE_TFSTATE_STORAGE_ACCOUNT)" \
-                            -backend-config="container_name=$(AZURE_TFSTATE_CONTAINER)" \
-                            -backend-config="key=${{ parameters.backendKey }}" \
-                            -backend-config="use_azuread_auth=true" \
-                            -backend-config="use_cli=true"
-                          terraform -chdir="${{ parameters.workingDirectory }}" apply -input=false -lock-timeout=5m \
-                            "$(Pipeline.Workspace)/terraform-plan/tfplan"
-                - ${{ if eq(parameters.cloud, 'aws') }}:
+                          CLOUD=azure TARGET_ENVIRONMENT="${{ parameters.targetEnvironment }}" \
+                          DEPLOYMENT_SCOPE="${{ parameters.deploymentScope }}" LAYER="${{ parameters.layer }}" \
+                          TFVARS_FILE="${{ parameters.tfvarsFile }}" PLAN_ACTION=apply \
+                          PLAN_DIR="$(Pipeline.Workspace)/terraform-plan" \
+                          AZURE_TFSTATE_RESOURCE_GROUP="$(AZURE_TFSTATE_RESOURCE_GROUP)" \
+                          AZURE_TFSTATE_STORAGE_ACCOUNT="$(AZURE_TFSTATE_STORAGE_ACCOUNT)" \
+                          AZURE_TFSTATE_CONTAINER="$(AZURE_TFSTATE_CONTAINER)" \
+                          AWS_TFSTATE_BUCKET="$(AWS_TFSTATE_BUCKET)" \
+                          AWS_TFSTATE_REGION="$(AWS_TFSTATE_REGION)" \
+                          bash templates/terraform-deploy.sh
+                - ${{ if ne(parameters.cloud, 'azure') }}:
                     - task: AWSShellScript@1
                       displayName: Initialize backend and apply plan
                       inputs:
@@ -149,10 +269,13 @@ stages:
                         scriptType: inline
                         inlineScript: |
                           set -euo pipefail
-                          terraform -chdir="${{ parameters.workingDirectory }}" init -input=false \
-                            -backend-config="bucket=$(AWS_TFSTATE_BUCKET)" \
-                            -backend-config="key=${{ parameters.backendKey }}" \
-                            -backend-config="region=$(AWS_TFSTATE_REGION)" \
-                            -backend-config="use_lockfile=true"
-                          terraform -chdir="${{ parameters.workingDirectory }}" apply -input=false -lock-timeout=5m \
-                            "$(Pipeline.Workspace)/terraform-plan/tfplan"
+                          CLOUD=aws TARGET_ENVIRONMENT="${{ parameters.targetEnvironment }}" \
+                          DEPLOYMENT_SCOPE="${{ parameters.deploymentScope }}" LAYER="${{ parameters.layer }}" \
+                          TFVARS_FILE="${{ parameters.tfvarsFile }}" PLAN_ACTION=apply \
+                          PLAN_DIR="$(Pipeline.Workspace)/terraform-plan" \
+                          AZURE_TFSTATE_RESOURCE_GROUP="$(AZURE_TFSTATE_RESOURCE_GROUP)" \
+                          AZURE_TFSTATE_STORAGE_ACCOUNT="$(AZURE_TFSTATE_STORAGE_ACCOUNT)" \
+                          AZURE_TFSTATE_CONTAINER="$(AZURE_TFSTATE_CONTAINER)" \
+                          AWS_TFSTATE_BUCKET="$(AWS_TFSTATE_BUCKET)" \
+                          AWS_TFSTATE_REGION="$(AWS_TFSTATE_REGION)" \
+                          bash templates/terraform-deploy.sh

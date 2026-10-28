@@ -1,0 +1,97 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - modules/**
+      - environments/**
+      - templates/**
+      - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - modules/**
+      - environments/**
+      - templates/**
+      - azure-pipelines.yml
+
+parameters:
+  - name: cloud
+    displayName: Cloud target
+    type: string
+    default: both
+    values:
+      - both
+      - azure
+      - aws
+  - name: targetEnvironment
+    displayName: Environment
+    type: string
+    default: dev
+    values:
+      - dev
+      - sit
+      - uat
+      - prod
+  - name: deploymentScope
+    displayName: Deployment scope
+    type: string
+    default: changed
+    values:
+      - changed
+      - layer
+      - all
+  - name: layer
+    displayName: Layer
+    type: string
+    default: network
+    values:
+      - foundation
+      - shared-services
+      - security
+      - network
+      - data
+      - compute
+      - platform
+      - integration
+      - operations
+      - application
+  - name: azureServiceConnection
+    displayName: Azure service connection
+    type: string
+    default: replace-with-azure-service-connection
+  - name: awsServiceConnection
+    displayName: AWS service connection
+    type: string
+    default: replace-with-aws-service-connection
+
+variables:
+  - name: AZURE_TFSTATE_RESOURCE_GROUP
+    value: replace-with-state-resource-group
+  - name: AZURE_TFSTATE_STORAGE_ACCOUNT
+    value: replacewithstateaccount
+  - name: AZURE_TFSTATE_CONTAINER
+    value: tfstate
+  - name: AWS_TFSTATE_BUCKET
+    value: replace-with-state-bucket
+  - name: AWS_TFSTATE_REGION
+    value: us-east-1
+  - name: AWS_REGION
+    value: us-east-1
+
+extends:
+  template: templates/terraform-pipeline.yml
+  parameters:
+    cloud: ${{ parameters.cloud }}
+    tfvarsFile: terraform.tfvars.example
+    targetEnvironment: ${{ parameters.targetEnvironment }}
+    deploymentScope: ${{ parameters.deploymentScope }}
+    layer: ${{ parameters.layer }}
+    environment: terraform-${{ parameters.cloud }}-${{ parameters.targetEnvironment }}
+    azureServiceConnection: ${{ parameters.azureServiceConnection }}
+    awsServiceConnection: ${{ parameters.awsServiceConnection }}
