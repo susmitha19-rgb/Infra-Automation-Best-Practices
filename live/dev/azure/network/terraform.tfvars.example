@@ -1,0 +1,10 @@
+location                = "eastus"
+resource_group_name     = "rg-infra-dev"
+virtual_network_name    = "vnet-infra-dev"
+address_space           = ["10.10.0.0/16"]
+subnet_name             = "snet-workload"
+subnet_address_prefixes = ["10.10.1.0/24"]
+tags = {
+  environment = "dev"
+  managed_by  = "terraform"
+}

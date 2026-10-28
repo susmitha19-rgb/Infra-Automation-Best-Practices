@@ -1,0 +1,128 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - modules/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - modules/**
+
+stages:
+  - stage: ValidateModules
+    displayName: Validate reusable modules
+    jobs:
+      - job: validate
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            fetchDepth: 0
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: 1.10.5
+          - bash: |
+              set -euo pipefail
+              terraform fmt -check -recursive
+              while IFS= read -r module_dir; do
+                echo "Validating $module_dir"
+                terraform -chdir="$module_dir" init -backend=false -input=false
+                terraform -chdir="$module_dir" validate
+              done < <(find modules -type f -name version.tf -printf '%h\n' | sort)
+            displayName: Format and validate modules
+
+  - stage: ReleaseModules
+    displayName: Version changed modules
+    dependsOn: ValidateModules
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: release
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: 1.10.5
+          - bash: |
+              set -euo pipefail
+              git fetch --tags origin
+              git config user.name "Azure DevOps"
+              git config user.email "azuredevops@local"
+              artifact_dir="$(Build.ArtifactStagingDirectory)/module-releases"
+              manifest="$artifact_dir/release-manifest.txt"
+              mkdir -p "$artifact_dir"
+
+              base="$(git rev-parse HEAD^ 2>/dev/null || true)"
+              if [[ -n "$base" ]]; then
+                changed_files="$(git diff --name-only "$base" HEAD -- modules/)"
+              else
+                changed_files="$(git ls-tree -r --name-only HEAD -- modules/)"
+              fi
+
+              mapfile -t changed_modules < <(
+                printf '%s\n' "$changed_files" |
+                  awk -F/ 'NF >= 5 && $1 == "modules" { print $1 "/" $2 "/" $3 "/" $4 }' |
+                  sort -u
+              )
+
+              if [[ ${#changed_modules[@]} -eq 0 ]]; then
+                echo "No module changes found." | tee "$manifest"
+              fi
+
+              for module_dir in "${changed_modules[@]}"; do
+                if [[ ! -f "$module_dir/version.tf" ]]; then
+                  echo "Module is missing version.tf: $module_dir" >&2
+                  exit 1
+                fi
+
+                module_name="${module_dir#modules/}"
+                tag_prefix="terraform-${module_name//\//-}"
+                module_tags="$(git tag --list "${tag_prefix}-v*")"
+                version="$(python3 - "$module_tags" "$tag_prefix" <<'PY'
+              import re
+              import sys
+
+              tags, prefix = sys.argv[1:]
+              pattern = re.compile(re.escape(prefix) + r"-v(\d+)\.(\d+)\.(\d+)")
+              versions = [
+                  tuple(map(int, match.groups()))
+                  for tag in tags.splitlines()
+                  if (match := pattern.fullmatch(tag))
+              ]
+              if not versions:
+                  print("1.0.0")
+              else:
+                  major, minor, patch = max(versions)
+                  print(f"{major}.{minor}.{patch + 1}")
+              PY
+              )"
+                tag="${tag_prefix}-v${version}"
+
+                echo "Releasing $module_dir as $tag"
+                git tag -a "$tag" -m "Release $module_name v$version"
+                git push origin "refs/tags/$tag"
+
+                release_dir="$artifact_dir/$module_name"
+                mkdir -p "$release_dir"
+                git archive --format=tar "$tag" "$module_dir" |
+                  gzip > "$release_dir/${tag}.tar.gz"
+                printf '%s\n' "$tag" > "$release_dir/version.txt"
+                printf '%s %s\n' "$module_dir" "$tag" | tee -a "$manifest"
+              done
+            displayName: Tag module releases and create source bundles
+          - task: PublishPipelineArtifact@1
+            displayName: Publish versioned module bundles
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/module-releases
+              artifact: terraform-module-releases

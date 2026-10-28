@@ -1,0 +1,11 @@
+state_resource_group_name  = "replace-with-state-resource-group"
+state_storage_account_name = "replacewithstateaccount"
+state_container_name       = "tfstate"
+virtual_machine_name       = "vm-infra-dev"
+virtual_machine_size       = "Standard_B2s"
+admin_username             = "azureuser"
+admin_ssh_public_key       = "REPLACE_WITH_SSH_PUBLIC_KEY"
+tags = {
+  environment = "dev"
+  managed_by  = "terraform"
+}

@@ -1,0 +1,6 @@
+region      = "us-east-1"
+bucket_name = "replace-with-a-globally-unique-name"
+tags = {
+  environment = "dev"
+  managed_by  = "terraform"
+}

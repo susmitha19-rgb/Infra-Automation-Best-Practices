@@ -1,0 +1,10 @@
+region            = "us-east-1"
+vpc_name          = "vpc-infra-dev"
+vpc_cidr          = "10.20.0.0/16"
+subnet_name       = "subnet-workload"
+subnet_cidr       = "10.20.1.0/24"
+availability_zone = "us-east-1a"
+tags = {
+  environment = "dev"
+  managed_by  = "terraform"
+}

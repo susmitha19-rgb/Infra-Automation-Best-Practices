@@ -1,0 +1,158 @@
+parameters:
+  - name: cloud
+    type: string
+    values:
+      - azure
+      - aws
+  - name: workingDirectory
+    type: string
+  - name: tfvarsFile
+    type: string
+    default: terraform.tfvars.example
+  - name: backendKey
+    type: string
+  - name: environment
+    type: string
+  - name: azureServiceConnection
+    type: string
+    default: ''
+  - name: awsServiceConnection
+    type: string
+    default: ''
+
+stages:
+  - stage: Validate
+    displayName: Validate Terraform
+    jobs:
+      - job: validate
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: 1.10.5
+          - bash: |
+              set -euo pipefail
+              terraform fmt -check -recursive
+              terraform -chdir="${{ parameters.workingDirectory }}" init -backend=false -input=false
+              terraform -chdir="${{ parameters.workingDirectory }}" validate
+            displayName: Format and validate
+
+  - stage: Plan
+    displayName: Plan deployment
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: plan
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: 1.10.5
+          - ${{ if eq(parameters.cloud, 'azure') }}:
+              - task: AzureCLI@2
+                displayName: Initialize backend and create plan
+                inputs:
+                  azureSubscription: ${{ parameters.azureServiceConnection }}
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    working_dir="${{ parameters.workingDirectory }}"
+                    mkdir -p "$(Build.ArtifactStagingDirectory)/terraform-plan"
+                    terraform -chdir="$working_dir" init -input=false \
+                      -backend-config="resource_group_name=$(AZURE_TFSTATE_RESOURCE_GROUP)" \
+                      -backend-config="storage_account_name=$(AZURE_TFSTATE_STORAGE_ACCOUNT)" \
+                      -backend-config="container_name=$(AZURE_TFSTATE_CONTAINER)" \
+                      -backend-config="key=${{ parameters.backendKey }}" \
+                      -backend-config="use_azuread_auth=true" \
+                      -backend-config="use_cli=true"
+                    terraform -chdir="$working_dir" plan -input=false -lock-timeout=5m \
+                      -var-file="${{ parameters.tfvarsFile }}" \
+                      -out="$(Build.ArtifactStagingDirectory)/terraform-plan/tfplan"
+          - ${{ if eq(parameters.cloud, 'aws') }}:
+              - task: AWSShellScript@1
+                displayName: Initialize backend and create plan
+                inputs:
+                  awsCredentials: ${{ parameters.awsServiceConnection }}
+                  regionName: $(AWS_REGION)
+                  scriptType: inline
+                  inlineScript: |
+                    set -euo pipefail
+                    working_dir="${{ parameters.workingDirectory }}"
+                    mkdir -p "$(Build.ArtifactStagingDirectory)/terraform-plan"
+                    terraform -chdir="$working_dir" init -input=false \
+                      -backend-config="bucket=$(AWS_TFSTATE_BUCKET)" \
+                      -backend-config="key=${{ parameters.backendKey }}" \
+                      -backend-config="region=$(AWS_TFSTATE_REGION)" \
+                      -backend-config="use_lockfile=true"
+                    terraform -chdir="$working_dir" plan -input=false -lock-timeout=5m \
+                      -var-file="${{ parameters.tfvarsFile }}" \
+                      -out="$(Build.ArtifactStagingDirectory)/terraform-plan/tfplan"
+          - task: PublishPipelineArtifact@1
+            displayName: Publish Terraform plan
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/terraform-plan
+              artifact: terraform-plan
+
+  - stage: Apply
+    displayName: Apply deployment
+    dependsOn: Plan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: apply
+        displayName: Apply reviewed plan
+        environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  persistCredentials: true
+                - task: TerraformInstaller@1
+                  displayName: Install Terraform
+                  inputs:
+                    terraformVersion: 1.10.5
+                - download: current
+                  artifact: terraform-plan
+                - ${{ if eq(parameters.cloud, 'azure') }}:
+                    - task: AzureCLI@2
+                      displayName: Initialize backend and apply plan
+                      inputs:
+                        azureSubscription: ${{ parameters.azureServiceConnection }}
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        inlineScript: |
+                          set -euo pipefail
+                          terraform -chdir="${{ parameters.workingDirectory }}" init -input=false \
+                            -backend-config="resource_group_name=$(AZURE_TFSTATE_RESOURCE_GROUP)" \
+                            -backend-config="storage_account_name=$(AZURE_TFSTATE_STORAGE_ACCOUNT)" \
+                            -backend-config="container_name=$(AZURE_TFSTATE_CONTAINER)" \
+                            -backend-config="key=${{ parameters.backendKey }}" \
+                            -backend-config="use_azuread_auth=true" \
+                            -backend-config="use_cli=true"
+                          terraform -chdir="${{ parameters.workingDirectory }}" apply -input=false -lock-timeout=5m \
+                            "$(Pipeline.Workspace)/terraform-plan/tfplan"
+                - ${{ if eq(parameters.cloud, 'aws') }}:
+                    - task: AWSShellScript@1
+                      displayName: Initialize backend and apply plan
+                      inputs:
+                        awsCredentials: ${{ parameters.awsServiceConnection }}
+                        regionName: $(AWS_REGION)
+                        scriptType: inline
+                        inlineScript: |
+                          set -euo pipefail
+                          terraform -chdir="${{ parameters.workingDirectory }}" init -input=false \
+                            -backend-config="bucket=$(AWS_TFSTATE_BUCKET)" \
+                            -backend-config="key=${{ parameters.backendKey }}" \
+                            -backend-config="region=$(AWS_TFSTATE_REGION)" \
+                            -backend-config="use_lockfile=true"
+                          terraform -chdir="${{ parameters.workingDirectory }}" apply -input=false -lock-timeout=5m \
+                            "$(Pipeline.Workspace)/terraform-plan/tfplan"

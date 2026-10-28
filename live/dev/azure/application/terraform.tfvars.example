@@ -1,0 +1,8 @@
+state_resource_group_name  = "replace-with-state-resource-group"
+state_storage_account_name = "replacewithstateaccount"
+state_container_name       = "tfstate"
+storage_account_name = "replacewithuniquename"
+tags = {
+  environment = "dev"
+  managed_by  = "terraform"
+}
