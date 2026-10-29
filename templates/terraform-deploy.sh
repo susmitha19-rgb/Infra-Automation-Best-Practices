@@ -9,11 +9,24 @@ set -euo pipefail
 : "${PLAN_ACTION:?PLAN_ACTION must be plan or apply}"
 : "${PLAN_DIR:?PLAN_DIR is required}"
 
-if [[ "$DEPLOYMENT_SCOPE" == "all" ]]; then
-  layers=(foundation shared-services security network data compute platform integration operations)
-  if [[ "$TARGET_ENVIRONMENT" == "dev" ]]; then
-    layers+=(application)
-  fi
+case "$DEPLOYMENT_SCOPE" in
+  changed|layer|all) ;;
+  *)
+    echo "Unsupported deployment scope: $DEPLOYMENT_SCOPE" >&2
+    exit 1
+    ;;
+esac
+
+SERVICE="${SERVICE:-all}"
+
+if [[ "$SERVICE" != "all" ]]; then
+  resolved_layers="$(python3 templates/service-registry.py resolve \
+    "$SERVICE" "$CLOUD" "$TARGET_ENVIRONMENT")"
+  mapfile -t layers <<< "$resolved_layers"
+  echo "Service $SERVICE resolves to layers: ${layers[*]}."
+elif [[ "$DEPLOYMENT_SCOPE" == "all" ]]; then
+  deployment_order="$(python3 templates/service-registry.py layers "$TARGET_ENVIRONMENT")"
+  mapfile -t layers <<< "$deployment_order"
 elif [[ "$DEPLOYMENT_SCOPE" == "layer" ]]; then
   layers=("$LAYER")
 elif [[ "$DEPLOYMENT_SCOPE" == "changed" ]]; then
@@ -30,7 +43,9 @@ elif [[ "$DEPLOYMENT_SCOPE" == "changed" ]]; then
       sort -u
   )
   layers=()
-  for candidate in foundation shared-services security network data compute platform integration operations application; do
+  deployment_order="$(python3 templates/service-registry.py layers "$TARGET_ENVIRONMENT")"
+  mapfile -t deployment_order <<< "$deployment_order"
+  for candidate in "${deployment_order[@]}"; do
     if grep -Fxq "$candidate" <<< "$changed_layers"; then
       layers+=("$candidate")
     fi

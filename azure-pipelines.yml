@@ -6,6 +6,9 @@ trigger:
     include:
       - modules/**
       - environments/**
+      - service-registry/**
+      - policies/**
+      - tests/**
       - templates/**
       - azure-pipelines.yml
 
@@ -17,12 +20,15 @@ pr:
     include:
       - modules/**
       - environments/**
+      - service-registry/**
+      - policies/**
+      - tests/**
       - templates/**
       - azure-pipelines.yml
 
 parameters:
-  - name: cloud
-    displayName: Cloud target
+  - name: provider
+    displayName: Provider
     type: string
     default: both
     values:
@@ -61,6 +67,17 @@ parameters:
       - integration
       - operations
       - application
+  - name: service
+    displayName: Service (all or registered ID)
+    type: string
+    default: all
+  - name: action
+    displayName: Action
+    type: string
+    default: apply
+    values:
+      - plan
+      - apply
   - name: azureServiceConnection
     displayName: Azure service connection
     type: string
@@ -87,11 +104,13 @@ variables:
 extends:
   template: templates/terraform-pipeline.yml
   parameters:
-    cloud: ${{ parameters.cloud }}
+    provider: ${{ parameters.provider }}
     tfvarsFile: terraform.tfvars.example
     targetEnvironment: ${{ parameters.targetEnvironment }}
     deploymentScope: ${{ parameters.deploymentScope }}
     layer: ${{ parameters.layer }}
-    environment: terraform-${{ parameters.cloud }}-${{ parameters.targetEnvironment }}
+    service: ${{ parameters.service }}
+    action: ${{ parameters.action }}
+    environment: terraform-${{ parameters.provider }}-${{ parameters.targetEnvironment }}
     azureServiceConnection: ${{ parameters.azureServiceConnection }}
     awsServiceConnection: ${{ parameters.awsServiceConnection }}

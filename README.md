@@ -2,6 +2,39 @@
 
 This repository is the infrastructure-as-code repository for a layer-based Azure and AWS platform. It provides reusable provider-specific modules, isolated environment roots, and Azure DevOps validation and deployment pipelines. Application source code and application build/release pipelines belong in separate application repositories; those repositories consume platform services but do not share Terraform state with this repository.
 
+## Executive summary
+
+The platform provides reusable Azure and AWS Terraform modules through a
+layer-based architecture and one parameterized Azure DevOps CI/CD model. Its
+configuration-driven service catalog resolves supported services to provider
+modules, environment roots, layers, and independent layer states. The design
+allows additional providers to be added without coupling provider-specific
+resource code.
+
+### Key design principles
+
+- Reuse versioned modules and keep cloud-specific implementations separate.
+- Organize infrastructure into layers with independent Terraform states.
+- Keep infrastructure and application repositories and release lifecycles
+  decoupled.
+- Use configuration-driven provider, environment, service, and action
+  selection.
+- Use one reusable CI/CD pipeline, security checks, production approval, and
+  auditable cloud credentials.
+
+### Repository structure
+
+```text
+modules/             Reusable provider-specific Terraform modules
+environments/        Environment/provider/layer Terraform roots and state config
+service-registry/    Service-to-layer/provider-module deployment catalog
+pipelines/           Azure DevOps pipeline entry-point guidance
+templates/           Reusable pipeline, deployment, and registry tooling
+policies/            Security checks and governance requirements
+docs/                Architecture and platform guidance
+azure-pipelines.yml  Single Azure DevOps pipeline entry point
+```
+
 ## Platform architecture
 
 The canonical deployment layers are:
@@ -59,30 +92,72 @@ An apply to one root changes only that root's state. It does not make changes to
 
 Modules declare Terraform/provider requirements but do not configure providers or remote state. Keep module interfaces stable and layer-oriented. Live roots use immutable, exact module tags; update a pin through a reviewed change rather than consuming a moving branch.
 
+## Service registry and deployment selection
+
+[`service-registry/services.json`](service-registry/services.json) maps the
+registered `network`, `compute`, and `application-storage` services to their
+owning layer, supported environments, and provider-specific module paths.
+[`templates/service-registry.py`](templates/service-registry.py) validates
+those mappings and supplies deployment order. Add services only when their
+module and environment root are present.
+
+The pipeline accepts provider, environment, service, and action parameters.
+Choose `all` for the existing changed/layer/all deployment scopes, or select a
+registered service to resolve its owning layer and declared prerequisite
+layers. A service deployment operates on those layer roots and states as
+units; it does not use Terraform `-target` or isolate an individual module
+inside a shared layer state. The dev-only application-storage service is not
+available in SIT, UAT, or production. Select `plan` to create and publish a
+plan without applying it, or `apply` to continue to the reviewed apply stage.
+
 ## Azure DevOps CI/CD
 
-Register **one** Azure DevOps pipeline for `azure-pipelines.yml`. Pull requests and main-branch runs format-check and validate all reusable modules and all Terraform roots. On `main`, changed modules are versioned with immutable annotated Git tags; the first release is `v1.0.0`, and later changes increment that module's patch version. Example:
+Register **one** Azure DevOps pipeline for `azure-pipelines.yml`. Pull requests and main-branch runs format-check and validate all reusable modules and Terraform roots, validate/test the service registry, and scan Terraform with blocking Checkov rules for AWS IMDSv2, encrypted EBS, S3 server-side encryption, and Azure Storage secure transfer. The required rules and external cloud controls are documented in [`policies/README.md`](policies/README.md).
+
+On `main`, changed modules are versioned with immutable annotated Git tags; the first release is `v1.0.0`, and later changes increment that module's patch version. Example:
 
 ```text
 terraform-network-azure-virtual-network-v1.0.1
 ```
 
-On a main-branch run, the pipeline automatically plans and applies changed roots after validation. Defaults are both clouds, dev, and changed layers. Select Azure or AWS for one cloud, select an environment deliberately, and choose one of three scopes: `changed` deploys roots changed in the triggering commit, `layer` deploys the chosen layer, and `all` deploys every layer in dependency order. An `all` run can target one cloud or both clouds; the legacy application-infrastructure root is included in dev. Each root still uses its own state file, and the saved plan for each cloud/layer is the plan that gets applied. If a change is made for SIT, UAT, or production, run the pipeline with that environment selected; non-production applies automatically after validation. Multi-root applies are sequential, not transactional: if one root fails, earlier successful applies remain in place and later roots are not applied.
+On a main-branch run, the pipeline plans roots after validation. Defaults are both clouds, dev, all services, apply action, and changed layers. Select Azure or AWS for one cloud, select an environment deliberately, and choose one of three scopes: `changed` deploys roots changed in the triggering commit, `layer` deploys the chosen layer, and `all` deploys every layer in the registry's configured deployment order. A selected service also includes its declared prerequisite layers in that order. An `all` run can target one cloud or both clouds; the legacy application-infrastructure root is included in dev. Each root still uses its own state file, and the saved plan for each cloud/layer is the plan that gets applied. If a change is made for SIT, UAT, or production, run the pipeline with that environment selected. Non-production applies proceed automatically when `apply` is selected; `plan` never applies. Multi-root applies are sequential, not transactional: if one root fails, earlier successful applies remain in place and later roots are not applied.
 
-Non-production deployments proceed automatically after validation. A production run stops at the `ProductionApproval` manual-validation stage before apply. Only approve after reviewing the plan artifact. Do not configure additional manual approvals on non-production environments. Do not overwrite or delete module release tags. The pipeline identity needs repository read and tag-create/push permissions.
+Production runs stop at the `ProductionApproval` manual-validation stage before apply. Only approve after reviewing the plan artifact. Do not configure additional manual approvals on non-production environments. Do not overwrite or delete module release tags. The pipeline identity needs repository read and tag-create/push permissions.
 
 Before enabling deployments:
 
 1. Provision the Azure Storage state container and encrypted, versioned S3 state bucket; configure recovery and lock-file permissions.
 2. Create least-privilege Azure Resource Manager and AWS service connections. Prefer workload federation or short-lived credentials.
 3. Configure the backend-store placeholders in `azure-pipelines.yml`, and select the appropriate service connection when queuing a deployment. Keep backend settings consistent and do not commit credentials.
-4. Create Azure DevOps Environments named `terraform-<cloud>-<environment>` for audit/tracking. The pipeline's production approval is an explicit manual-validation stage; no separate manual approval is needed on non-production environments.
+4. Create Azure DevOps Environments named `terraform-<provider>-<environment>` (use `both` when targeting both providers) for audit/tracking. The pipeline's production approval is an explicit manual-validation stage; no separate manual approval is needed on non-production environments.
 5. Replace the Azure Repos placeholders in existing live module sources with the correct organization, project, and repository before validating those roots.
 6. Use non-secret example variable values. Never put credentials, private keys, or other secrets in Terraform files, variable files, or saved plan artifacts. Restrict access to plan artifacts because they can contain sensitive values.
 
 This infrastructure pipeline does not deploy application code. The separate application repository owns its build and release lifecycle and deploys independently against the provisioned platform, so application releases do not trigger infrastructure state changes.
 
 The legacy dev AWS sample has no internet gateway/NAT, and its instances have no public IP or inbound security-group rule. Add organization-approved private connectivity and management access before deploying workloads that require access.
+
+## Governance and end-state vision
+
+Use organization-approved resource naming and tags, least-privilege RBAC,
+protected branches, production approval gates, policy validation, audit
+logging, and encrypted/versioned state backends. Pipeline checks cover
+repository-level Terraform controls; cloud RBAC, policy assignments, backend
+provisioning, retention, and audit settings must also be configured in the
+target cloud and Azure DevOps organization. See
+[`policies/README.md`](policies/README.md).
+Reusable modules require a non-empty `environment` tag and
+`managed_by = "terraform"`; extend this baseline with organization-required
+ownership and cost-allocation tags.
+
+The target experience is for users to provide provider, environment, service,
+and action while the platform resolves module mappings, layer ownership,
+approved versions, dependencies, and state locations. The current registry
+resolves supported services to layer roots and declared prerequisite layers;
+the pipeline resolves deployment order and state keys, while module versions
+remain pinned in each root. Broader provider coverage and dependency discovery
+beyond explicitly declared catalog edges remain future extensions. See
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Extending a layer
 

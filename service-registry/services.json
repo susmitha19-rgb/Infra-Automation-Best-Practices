@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "deployment_order": [
+    "foundation",
+    "shared-services",
+    "security",
+    "network",
+    "data",
+    "compute",
+    "platform",
+    "integration",
+    "operations"
+  ],
+  "layer_dependencies": {
+    "foundation": [],
+    "shared-services": [],
+    "security": [],
+    "network": [],
+    "data": [],
+    "compute": [
+      "network"
+    ],
+    "platform": [],
+    "integration": [],
+    "operations": [],
+    "application": []
+  },
+  "legacy_layers": {
+    "dev": [
+      "application"
+    ]
+  },
+  "services": {
+    "application-storage": {
+      "layer": "application",
+      "environments": [
+        "dev"
+      ],
+      "modules": {
+        "azure": [
+          "modules/application/azure/storage-account"
+        ],
+        "aws": [
+          "modules/application/aws/s3-bucket"
+        ]
+      }
+    },
+    "compute": {
+      "layer": "compute",
+      "environments": [
+        "dev",
+        "sit",
+        "uat",
+        "prod"
+      ],
+      "modules": {
+        "azure": [
+          "modules/compute/azure/linux-virtual-machine"
+        ],
+        "aws": [
+          "modules/compute/aws/ec2-instance"
+        ]
+      }
+    },
+    "network": {
+      "layer": "network",
+      "environments": [
+        "dev",
+        "sit",
+        "uat",
+        "prod"
+      ],
+      "modules": {
+        "azure": [
+          "modules/network/azure/resource-group",
+          "modules/network/azure/virtual-network"
+        ],
+        "aws": [
+          "modules/network/aws/vpc"
+        ]
+      }
+    }
+  }
+}

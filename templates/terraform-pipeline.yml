@@ -1,5 +1,5 @@
 parameters:
-  - name: cloud
+  - name: provider
     type: string
     values:
       - both
@@ -11,6 +11,14 @@ parameters:
     type: string
   - name: layer
     type: string
+  - name: service
+    type: string
+    default: all
+  - name: action
+    type: string
+    values:
+      - plan
+      - apply
   - name: tfvarsFile
     type: string
     default: terraform.tfvars.example
@@ -40,6 +48,8 @@ stages:
           - bash: |
               set -euo pipefail
               terraform fmt -check -recursive
+              python3 templates/service-registry.py validate
+              python3 -m unittest discover -s tests -v
               while IFS= read -r module_dir; do
                 echo "Validating $module_dir"
                 terraform -chdir="$module_dir" init -backend=false -input=false
@@ -52,9 +62,33 @@ stages:
               done < <(find environments -type f -name backend.tf -printf '%h\n' | sort)
             displayName: Format and validate all modules and roots
 
+  - stage: SecurityScan
+    displayName: Scan Terraform security controls
+    dependsOn: Validate
+    jobs:
+      - job: security_scan
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: UsePythonVersion@0
+            displayName: Select Python
+            inputs:
+              versionSpec: '3.11'
+          - bash: |
+              set -euo pipefail
+              python3 -m pip install --disable-pip-version-check checkov==3.2.99
+              checkov --directory modules --framework terraform \
+                --check CKV_AWS_79,CKV_AWS_8,CKV_AWS_19,CKV_AZURE_3
+              checkov --directory environments --framework terraform \
+                --check CKV_AWS_79,CKV_AWS_8,CKV_AWS_19,CKV_AZURE_3
+            displayName: Run blocking Checkov security policies
+
   - stage: ReleaseModules
     displayName: Version changed modules
-    dependsOn: Validate
+    dependsOn:
+      - Validate
+      - SecurityScan
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
     jobs:
       - job: release
@@ -141,6 +175,7 @@ stages:
     displayName: Plan deployment
     dependsOn:
       - Validate
+      - SecurityScan
       - ReleaseModules
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
     jobs:
@@ -155,7 +190,7 @@ stages:
             displayName: Install Terraform
             inputs:
               terraformVersion: 1.10.5
-          - ${{ if ne(parameters.cloud, 'aws') }}:
+          - ${{ if ne(parameters.provider, 'aws') }}:
               - task: AzureCLI@2
                 name: planAzure
                 displayName: Initialize backend and create plan
@@ -167,6 +202,7 @@ stages:
                     set -euo pipefail
                     CLOUD=azure TARGET_ENVIRONMENT="${{ parameters.targetEnvironment }}" \
                     DEPLOYMENT_SCOPE="${{ parameters.deploymentScope }}" LAYER="${{ parameters.layer }}" \
+                    SERVICE="${{ parameters.service }}" \
                     TFVARS_FILE="${{ parameters.tfvarsFile }}" PLAN_ACTION=plan \
                     PLAN_DIR="$(Build.ArtifactStagingDirectory)/terraform-plan" \
                     AZURE_TFSTATE_RESOURCE_GROUP="$(AZURE_TFSTATE_RESOURCE_GROUP)" \
@@ -175,7 +211,7 @@ stages:
                     AWS_TFSTATE_BUCKET="$(AWS_TFSTATE_BUCKET)" \
                     AWS_TFSTATE_REGION="$(AWS_TFSTATE_REGION)" \
                     bash templates/terraform-deploy.sh
-          - ${{ if ne(parameters.cloud, 'azure') }}:
+          - ${{ if ne(parameters.provider, 'azure') }}:
               - task: AWSShellScript@1
                 name: planAws
                 displayName: Initialize backend and create plan
@@ -187,6 +223,7 @@ stages:
                     set -euo pipefail
                     CLOUD=aws TARGET_ENVIRONMENT="${{ parameters.targetEnvironment }}" \
                     DEPLOYMENT_SCOPE="${{ parameters.deploymentScope }}" LAYER="${{ parameters.layer }}" \
+                    SERVICE="${{ parameters.service }}" \
                     TFVARS_FILE="${{ parameters.tfvarsFile }}" PLAN_ACTION=plan \
                     PLAN_DIR="$(Build.ArtifactStagingDirectory)/terraform-plan" \
                     AZURE_TFSTATE_RESOURCE_GROUP="$(AZURE_TFSTATE_RESOURCE_GROUP)" \
@@ -204,7 +241,7 @@ stages:
   - stage: ProductionApproval
     displayName: Production approval
     dependsOn: Plan
-    condition: and(succeeded(), eq('${{ parameters.targetEnvironment }}', 'prod'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'), or(eq(dependencies.Plan.outputs['plan.planAzure.hasDeploymentChanges'], 'true'), eq(dependencies.Plan.outputs['plan.planAws.hasDeploymentChanges'], 'true')))
+    condition: and(succeeded(), eq('${{ parameters.action }}', 'apply'), eq('${{ parameters.targetEnvironment }}', 'prod'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'), or(eq(dependencies.Plan.outputs['plan.planAzure.hasDeploymentChanges'], 'true'), eq(dependencies.Plan.outputs['plan.planAws.hasDeploymentChanges'], 'true')))
     jobs:
       - job: approval
         displayName: Wait for production approval
@@ -223,7 +260,7 @@ stages:
     dependsOn:
       - Plan
       - ProductionApproval
-    condition: and(not(canceled()), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'), eq(dependencies.Plan.result, 'Succeeded'), or(eq(dependencies.Plan.outputs['plan.planAzure.hasDeploymentChanges'], 'true'), eq(dependencies.Plan.outputs['plan.planAws.hasDeploymentChanges'], 'true')), in(dependencies.ProductionApproval.result, 'Succeeded', 'Skipped'))
+    condition: and(not(canceled()), eq('${{ parameters.action }}', 'apply'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'), eq(dependencies.Plan.result, 'Succeeded'), or(eq(dependencies.Plan.outputs['plan.planAzure.hasDeploymentChanges'], 'true'), eq(dependencies.Plan.outputs['plan.planAws.hasDeploymentChanges'], 'true')), in(dependencies.ProductionApproval.result, 'Succeeded', 'Skipped'))
     jobs:
       - deployment: apply
         displayName: Apply reviewed plan
@@ -241,7 +278,7 @@ stages:
                     terraformVersion: 1.10.5
                 - download: current
                   artifact: terraform-plan
-                - ${{ if ne(parameters.cloud, 'aws') }}:
+                - ${{ if ne(parameters.provider, 'aws') }}:
                     - task: AzureCLI@2
                       displayName: Initialize backend and apply plan
                       inputs:
@@ -252,6 +289,7 @@ stages:
                           set -euo pipefail
                           CLOUD=azure TARGET_ENVIRONMENT="${{ parameters.targetEnvironment }}" \
                           DEPLOYMENT_SCOPE="${{ parameters.deploymentScope }}" LAYER="${{ parameters.layer }}" \
+                          SERVICE="${{ parameters.service }}" \
                           TFVARS_FILE="${{ parameters.tfvarsFile }}" PLAN_ACTION=apply \
                           PLAN_DIR="$(Pipeline.Workspace)/terraform-plan" \
                           AZURE_TFSTATE_RESOURCE_GROUP="$(AZURE_TFSTATE_RESOURCE_GROUP)" \
@@ -260,7 +298,7 @@ stages:
                           AWS_TFSTATE_BUCKET="$(AWS_TFSTATE_BUCKET)" \
                           AWS_TFSTATE_REGION="$(AWS_TFSTATE_REGION)" \
                           bash templates/terraform-deploy.sh
-                - ${{ if ne(parameters.cloud, 'azure') }}:
+                - ${{ if ne(parameters.provider, 'azure') }}:
                     - task: AWSShellScript@1
                       displayName: Initialize backend and apply plan
                       inputs:
@@ -271,6 +309,7 @@ stages:
                           set -euo pipefail
                           CLOUD=aws TARGET_ENVIRONMENT="${{ parameters.targetEnvironment }}" \
                           DEPLOYMENT_SCOPE="${{ parameters.deploymentScope }}" LAYER="${{ parameters.layer }}" \
+                          SERVICE="${{ parameters.service }}" \
                           TFVARS_FILE="${{ parameters.tfvarsFile }}" PLAN_ACTION=apply \
                           PLAN_DIR="$(Pipeline.Workspace)/terraform-plan" \
                           AZURE_TFSTATE_RESOURCE_GROUP="$(AZURE_TFSTATE_RESOURCE_GROUP)" \
